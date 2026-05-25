@@ -55,19 +55,50 @@ app.add_middleware(
 
 # ---------------- EMOTION DETECTION MODEL ---------------- #
 
+# Try multiple model file formats: prefer H5, fall back to JSON+weights
+model = None
 try:
-    model = tf.keras.models.load_model("cnn.h5")
-    print("Emotion detection model loaded")
+    if os.path.exists("cnn.h5"):
+        model = tf.keras.models.load_model("cnn.h5")
+        print("Emotion detection model loaded from cnn.h5")
+    elif os.path.exists("CNN_model.json") and os.path.exists("CNN_model.weights.h5"):
+        from tensorflow.keras.models import model_from_json
+        with open("CNN_model.json", "r") as f:
+            model = model_from_json(f.read())
+        model.load_weights("CNN_model.weights.h5")
+        print("Emotion detection model loaded from CNN_model.json + weights")
+    else:
+        raise FileNotFoundError("No model file found (cnn.h5 or CNN_model.json+weights)")
 except Exception as e:
     print("Error loading emotion model:", e)
     raise e
 
-EMOTION_LABELS = [
-    'angry', 'calm', 'disgust', 'fearful',
-    'happy', 'neutral', 'sad', 'surprised'
-]
+# Try to load scaler and encoder saved during training (optional but recommended)
+scaler = None
+encoder = None
+try:
+    if os.path.exists("scaler2.pickle"):
+        scaler = joblib.load("scaler2.pickle")
+        print("Scaler loaded: scaler2.pickle")
+    if os.path.exists("encoder2.pickle"):
+        encoder = joblib.load("encoder2.pickle")
+        print("Encoder loaded: encoder2.pickle")
+except Exception as e:
+    print("Warning: failed to load scaler/encoder:", e)
 
-PANIC_EMOTIONS = ['angry', 'fearful', 'sad']
+# Determine labels either from encoder or fallback
+if encoder is not None and hasattr(encoder, 'categories'):
+    try:
+        EMOTION_LABELS = list(encoder.categories_[0])
+        print("EMOTION_LABELS set from encoder:", EMOTION_LABELS)
+    except Exception:
+        EMOTION_LABELS = ['angry', 'calm', 'disgust', 'fearful', 'happy', 'neutral', 'sad', 'surprised']
+else:
+    EMOTION_LABELS = ['angry', 'calm', 'disgust', 'fearful', 'happy', 'neutral', 'sad', 'surprised']
+
+# Build panic list robustly to handle label name variations (e.g. 'fear' vs 'fearful')
+_panic_keywords = {'angry', 'fear', 'fearful', 'sad'}
+PANIC_EMOTIONS = [lbl for lbl in EMOTION_LABELS if lbl in _panic_keywords]
 
 # ---------------- SAFE ROUTE ML MODEL ---------------- #
 
@@ -130,11 +161,47 @@ class RealtimeRequest(BaseModel):
 
 # ---------------- AUDIO FEATURE EXTRACTION ---------------- #
 
-def extract_feature(data, sr):
-    mfcc = np.mean(librosa.feature.mfcc(y=data, sr=sr, n_mfcc=40).T, axis=0)
-    chroma = np.mean(librosa.feature.chroma_stft(y=data, sr=sr).T, axis=0)
-    mel = np.mean(librosa.feature.melspectrogram(y=data, sr=sr).T, axis=0)
-    return np.hstack([mfcc, chroma, mel])
+# Helper functions copied/adapted from the training notebook pipeline
+def zcr(data, frame_length=2048, hop_length=512):
+    return np.squeeze(librosa.feature.zero_crossing_rate(y=data, frame_length=frame_length, hop_length=hop_length))
+
+
+def rmse(data, frame_length=2048, hop_length=512):
+    return np.squeeze(librosa.feature.rms(y=data, frame_length=frame_length, hop_length=hop_length))
+
+
+def mfcc_feat(data, sr, n_mfcc=13, frame_length=2048, hop_length=512, flatten=True):
+    mfccs = librosa.feature.mfcc(y=data, sr=sr, n_mfcc=n_mfcc)
+    return np.ravel(mfccs.T) if flatten else np.squeeze(mfccs.T)
+
+
+def extract_features(data, sr=22050):
+    # concatenate zero-crossing rate, rmse and mfccs (flattened)
+    a = zcr(data)
+    b = rmse(data)
+    c = mfcc_feat(data, sr)
+    return np.hstack((a, b, c))
+
+
+def get_predict_feat(path, duration=2.5, offset=0.6, sr=22050):
+    # load with fixed duration/offset to match training preprocessing
+    data, sample_rate = librosa.load(path, sr=sr, duration=duration, offset=offset)
+
+    features = extract_features(data, sample_rate)
+
+    # reshape to 2D (1, -1) for scaler
+    features = features.reshape(1, -1)
+
+    # apply scaler if available
+    if scaler is not None:
+        try:
+            features = scaler.transform(features)
+        except Exception as e:
+            print("Warning: scaler transform failed:", e)
+
+    # expand to (1, timesteps, 1) for the CNN
+    X = np.expand_dims(features, axis=2)
+    return X
 
 
 # ---------------- EMOTION PREDICTION API ---------------- #
@@ -183,31 +250,52 @@ def predict(req: AudioRequest, request: Request = None):
         if not os.path.exists(wav_path):
             raise HTTPException(status_code=500, detail="Temp WAV file not created")
 
-        # Load audio
-        y, sr = librosa.load(wav_path, sr=None)
+        # Prepare features using the same preprocessing used during training
+        # (fixed duration/offset, feature extraction, scaler, reshape)
+        print("Preparing features for model (wav_path):", wav_path)
 
-        if y is None or len(y) == 0:
-            raise HTTPException(status_code=500, detail="Librosa could not load audio")
+        try:
+            X = get_predict_feat(wav_path)
+        except Exception as e:
+            print("Feature extraction failed:", e)
+            raise HTTPException(status_code=500, detail=f"Feature extraction failed: {e}")
 
-        print("Audio loaded:", y.shape, "Sample rate:", sr)
+        # Log shapes for debugging
+        try:
+            print("Model input shape expected:", getattr(model, 'input_shape', None))
+            print("Prepared input shape:", X.shape)
+        except Exception:
+            pass
 
-        # Extract features
-        features = extract_feature(y, sr)
+        preds = model.predict(X)
 
-        # Prepare model input
-        X = np.expand_dims(features, axis=0)
-        X = np.expand_dims(X, axis=2)
+        # model.predict may return shape (1, n_classes) or (n_variants, n_classes)
+        if preds.ndim == 2 and preds.shape[0] == 1:
+            probs = preds[0]
+        else:
+            # if multiple rows (e.g., augmentations), average probabilities
+            probs = np.mean(preds, axis=0)
 
-        preds = model.predict(X)[0]
+        confidence = float(np.max(probs))
 
-        idx = np.argmax(preds)
-
-        emotion = EMOTION_LABELS[idx]
+        # decode label using encoder if available
+        emotion = None
+        try:
+            if encoder is not None:
+                decoded = encoder.inverse_transform(probs.reshape(1, -1))
+                emotion = decoded[0][0]
+            else:
+                idx = int(np.argmax(probs))
+                emotion = EMOTION_LABELS[idx]
+        except Exception as e:
+            print("Label decode failed, falling back to argmax:", e)
+            idx = int(np.argmax(probs))
+            emotion = EMOTION_LABELS[idx]
 
         return {
             "emotion": emotion,
             "panic": emotion in PANIC_EMOTIONS,
-            "confidence": float(preds[idx])
+            "confidence": confidence
         }
 
     except HTTPException as e:
